@@ -312,6 +312,41 @@ def _warn_dropped_env_only_keys(
     )
 
 
+def _close_litellm_stream(stream_response: Any) -> None:
+    """Release the HTTP connection behind a partially-consumed litellm sync stream.
+
+    A sync stream abandoned without close is only cleaned up when the periodic
+    GC collects its reference cycle, and GC finalizers run on whichever thread
+    happens to trigger collection — including a thread that is currently inside
+    httpcore's connection-pool lock. The finalizer then re-enters that
+    non-reentrant lock and permanently deadlocks the shared pool
+    (litellm.module_level_client), wedging every subsequent LLM call in the
+    process. Closing here runs on the calling thread, which cannot be holding
+    the pool lock, so cleanup is safe.
+
+    litellm's CustomStreamWrapper only exposes an async aclose(), so this
+    reaches into the provider iterator and closes the innermost closeable
+    object (e.g. Anthropic's httpx ``iter_lines()`` generator). Closing an
+    exhausted generator is a no-op; unknown iterator shapes (lists from
+    mock/cached streams) are skipped.
+    """
+    inner = getattr(stream_response, "completion_stream", None)
+    candidates = (
+        getattr(inner, "streaming_response", None),
+        getattr(inner, "response_iterator", None),
+        inner,
+        stream_response,
+    )
+    for candidate in candidates:
+        close = getattr(candidate, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Error closing litellm stream", exc_info=True)
+            return
+
+
 class LitellmLLM(LLM):
     """Uses Litellm library to allow easy configuration to use a multitude of LLMs
     See https://python.langchain.com/docs/integrations/chat/litellm"""
@@ -849,11 +884,12 @@ class LitellmLLM(LLM):
         #      corrupt the pool state for other threads
         #    - Each request gets its own fresh httpx.Client via HTTPHandler
         #
-        # 3. WHY OTHER PROVIDERS DON'T NEED THIS:
-        #    - Other providers (Anthropic, Bedrock, etc.) use litellm.module_level_client
-        #      which handles concurrency appropriately
-        #    - httpx.Client itself IS thread-safe for concurrent requests
-        #    - The issue is specific to OpenAI's responses API path and connection reuse
+        # 3. OTHER PROVIDERS SHARE litellm.module_level_client:
+        #    - httpx.Client is thread-safe for concurrent requests, BUT a stream
+        #      abandoned without close is finalized by the periodic GC, which can run
+        #      on a thread inside httpcore's non-reentrant connection-pool lock and
+        #      permanently deadlock the shared pool (every later LLM call then blocks
+        #      forever). Hence _close_litellm_stream on every non-exhausted exit.
         #
         # 4. PITFALL - is_true_openai_model() CHECK:
         #    - Must use is_true_openai_model() NOT just check model_provider == "openai"
@@ -894,7 +930,11 @@ class LitellmLLM(LLM):
                     client=client,
                 ),
             )
-            chunks = list(stream_response)
+            try:
+                chunks = list(stream_response)
+            except BaseException:
+                _close_litellm_stream(stream_response)
+                raise
             response = cast(
                 LiteLLMModelResponse,
                 stream_chunk_builder(chunks),
@@ -976,6 +1016,7 @@ class LitellmLLM(LLM):
             if is_true_openai_model(self.config.model_provider, self.config.model_name):
                 client = HTTPHandler(timeout=timeout_override or self._timeout)
 
+            response: LiteLLMCustomStreamWrapper | None = None
             try:
                 response = cast(
                     LiteLLMCustomStreamWrapper,
@@ -1015,6 +1056,10 @@ class LitellmLLM(LLM):
                     max_attempts,
                 )
             finally:
+                # Covers abandonment (GeneratorExit), mid-stream errors, and
+                # retries; a no-op when the stream was fully consumed.
+                if response is not None:
+                    _close_litellm_stream(response)
                 if client is not None:
                     client.close()
 
