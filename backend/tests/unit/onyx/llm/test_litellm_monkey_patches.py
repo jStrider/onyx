@@ -189,3 +189,27 @@ def test_responses_transform_response_preserves_reasoning_summary_sections() -> 
     assert (
         result.choices[0].message.reasoning_content == "first section\n\nsecond section"
     )
+
+
+def test_httpcore_thread_lock_is_reentrant_after_patch() -> None:
+    """GC-time stream cleanup re-enters the pool lock on the same thread; the
+    patch must make that recurse instead of self-deadlock (httpcore#996)."""
+    import threading
+
+    import litellm
+    from httpcore import _synchronization
+
+    apply_monkey_patches()
+
+    rlock_type = type(threading.RLock())
+
+    # Future pools get RLocks from the patched class...
+    assert isinstance(_synchronization.ThreadLock()._lock, rlock_type)
+    # ...and the pre-existing shared client's pool lock was swapped in place.
+    pool = litellm.module_level_client.client._transport._pool  # ty: ignore[unresolved-attribute]
+    assert isinstance(pool._optional_thread_lock._lock, rlock_type)
+
+    # Prove reentrancy end-to-end on the patched shared pool lock.
+    with pool._optional_thread_lock:
+        with pool._optional_thread_lock:
+            pass

@@ -57,6 +57,21 @@ Status checked against LiteLLM v1.93.0 (2026-07-20):
          setattr in v1.93.0. Our patch rebuilds the response via model_construct so the
          original ResponseAPIUsage object is preserved. Handles ResponseCompletedEvent,
          ResponseIncompleteEvent, and ResponseFailedEvent (matching upstream).
+
+7. httpcore ThreadLock Reentrancy (_patch_httpcore_thread_lock_reentrant):
+   - httpcore's sync ConnectionPool guards its state with a non-reentrant
+     threading.Lock (ThreadLock). A streaming response abandoned without close is
+     finalized by the periodic GC, which can run on a thread that is currently
+     inside the locked section; the finalizer closes the response, re-enters the
+     same lock on the same thread, and permanently deadlocks the pool. For
+     litellm.module_level_client (shared by all non-OpenAI sync calls) this wedges
+     every subsequent LLM call in the process. Onyx closes its own streams
+     deterministically (see multi_llm._close_litellm_stream); this patch guards the
+     paths Onyx does not control by making the lock reentrant, so a GC-time close
+     recurses harmlessly instead of deadlocking.
+   - Upstream: encode/httpcore#996 (closed unfixed, identical stack),
+     discussions #990/#997, open PR encode/httpcore#1003 (this exact change).
+   STATUS: STILL NEEDED - httpcore 1.0.9 is latest; no fixed release exists.
 """
 
 import time
@@ -70,6 +85,10 @@ from litellm.completion_extras.litellm_responses_transformation.transformation i
 from litellm.llms.ollama.chat.transformation import OllamaChatCompletionResponseIterator
 from litellm.llms.ollama.common_utils import OllamaError
 from litellm.types.utils import ChatCompletionUsageBlock, ModelResponseStream
+
+from onyx.utils.logger import setup_logger
+
+logger = setup_logger()
 
 # Original upstream chunk_parser, saved before any patching for fallback use
 _original_responses_chunk_parser = (
@@ -583,6 +602,33 @@ def _patch_logging_assembled_streaming_response() -> None:
     )
 
 
+def _patch_httpcore_thread_lock_reentrant() -> None:
+    import threading
+
+    import litellm
+    from httpcore import _synchronization
+
+    def _reentrant_init(self: Any) -> None:
+        self._lock = threading.RLock()
+
+    _synchronization.ThreadLock.__init__ = _reentrant_init  # ty: ignore[invalid-assignment]
+
+    # litellm.module_level_client was constructed at litellm import time, before
+    # this patch ran, so its pool still holds a plain Lock — swap it in place.
+    # The traversal (httpx.Client -> HTTPTransport -> ConnectionPool) is private
+    # API; degrade to a warning if httpx/httpcore internals move, since the
+    # class-level patch above still covers every pool created afterwards.
+    try:
+        client = litellm.module_level_client.client
+        pool = client._transport._pool  # ty: ignore[unresolved-attribute]
+        pool._optional_thread_lock._lock = threading.RLock()
+    except AttributeError:
+        logger.warning(
+            "Could not swap litellm.module_level_client pool lock to RLock; "
+            "httpx/httpcore internals may have changed"
+        )
+
+
 def apply_monkey_patches() -> None:
     """
     Apply all necessary monkey patches to LiteLLM for compatibility.
@@ -594,6 +640,8 @@ def apply_monkey_patches() -> None:
     - Patching AzureOpenAIResponsesAPIConfig.should_fake_stream to enable native streaming
     - Patching ResponsesAPIResponse.model_construct to fix usage format in all code paths
     - Patching Logging._get_assembled_streaming_response to avoid mutating original response
+    - Patching httpcore's ThreadLock to be reentrant so GC-time stream cleanup
+      cannot self-deadlock the shared sync connection pool
     """
     _patch_ollama_chunk_parser()
     _patch_responses_reasoning_summary_newlines()
@@ -601,3 +649,4 @@ def apply_monkey_patches() -> None:
     _patch_azure_responses_should_fake_stream()
     _patch_responses_api_usage_format()
     _patch_logging_assembled_streaming_response()
+    _patch_httpcore_thread_lock_reentrant()
